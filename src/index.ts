@@ -91,12 +91,12 @@ const PAGINATION_BASE_SCHEMA = {
     type: "number",
     minimum: 1,
     maximum: BITBUCKET_MAX_PAGELEN,
-    description: `Number of items per page (Bitbucket pagelen). Defaults to ${BITBUCKET_DEFAULT_PAGELEN} and caps at ${BITBUCKET_MAX_PAGELEN}.`,
+    description: `Number of items per page (Bitbucket Server limit). Defaults to ${BITBUCKET_DEFAULT_PAGELEN} and caps at ${BITBUCKET_MAX_PAGELEN}.`,
   },
   page: {
     type: "number",
     minimum: 1,
-    description: "Bitbucket page number to fetch (1-based).",
+    description: "Page number to fetch (1-based); converted to a start offset internally.",
   },
 };
 
@@ -324,37 +324,14 @@ interface BitbucketConfig {
   allowDangerousCommands?: boolean;
 }
 
-// Normalize Bitbucket configuration for backward compatibility and DX
+// Normalize Bitbucket Server configuration
 function normalizeBitbucketConfig(rawConfig: BitbucketConfig): BitbucketConfig {
   let normalizedConfig = { ...rawConfig };
   try {
-    const parsed = new URL(rawConfig.baseUrl);
-    const host = parsed.hostname.toLowerCase();
-
-    // If users provide a web URL like https://bitbucket.org/<workspace>,
-    // extract the workspace and switch to the public API base URL
-    if (host === "bitbucket.org" || host === "www.bitbucket.org") {
-      const segments = parsed.pathname.split("/").filter(Boolean);
-      if (!normalizedConfig.defaultWorkspace && segments.length >= 1) {
-        normalizedConfig.defaultWorkspace = segments[0];
-      }
-      normalizedConfig.baseUrl = "https://api.bitbucket.org/2.0";
-    }
-
-    // If users provide https://api.bitbucket.org (without /2.0), ensure /2.0
-    if (host === "api.bitbucket.org") {
-      const pathname = parsed.pathname.replace(/\/+$/, "");
-      if (!pathname.startsWith("/2.0")) {
-        normalizedConfig.baseUrl = "https://api.bitbucket.org/2.0";
-      } else {
-        normalizedConfig.baseUrl = "https://api.bitbucket.org/2.0";
-      }
-    }
-
     // Remove trailing slashes for a consistent axios baseURL
     normalizedConfig.baseUrl = normalizedConfig.baseUrl.replace(/\/+$/, "");
   } catch {
-    // If baseUrl is not a valid absolute URL, keep as-is (custom/self-hosted cases)
+    // If baseUrl is not a valid absolute URL, keep as-is
   }
 
   return normalizedConfig;
@@ -502,7 +479,7 @@ class BitbucketServer {
 
     // Configuration from environment variables
     const initialConfig: BitbucketConfig = {
-      baseUrl: process.env.BITBUCKET_URL ?? "https://api.bitbucket.org/2.0",
+      baseUrl: process.env.BITBUCKET_URL ?? "",
       token: process.env.BITBUCKET_TOKEN,
       username: process.env.BITBUCKET_USERNAME,
       password: process.env.BITBUCKET_PASSWORD,
@@ -661,7 +638,7 @@ class BitbucketServer {
                 type: "array",
                 items: { type: "string" },
                 description:
-                  "List of reviewer UUIDs (e.g., '{04776764-62c7-453b-b97e-302f60395ceb}')",
+                  "List of reviewer usernames/slugs (e.g., 'johndoe')",
               },
               draft: {
                 type: "boolean",
@@ -1230,7 +1207,7 @@ class BitbucketServer {
                 type: "array",
                 items: { type: "string" },
                 description:
-                  "List of reviewer UUIDs (e.g., '{04776764-62c7-453b-b97e-302f60395ceb}')",
+                  "List of reviewer usernames/slugs (e.g., 'johndoe')",
               },
             },
             required: [
@@ -2381,7 +2358,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/effective-default-reviewers`
+        `/rest/default-reviewers/latest/projects/${workspace}/repos/${repo_slug}/conditions`
       );
 
       return {
@@ -2432,7 +2409,7 @@ class BitbucketServer {
       }
 
       const result = await this.paginator.fetchValues<BitbucketPullRequest>(
-        `/repositories/${workspace}/${repo_slug}/pullrequests`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests`,
         {
           pagelen: pagelen ?? legacyLimit,
           page,
@@ -2484,37 +2461,39 @@ class BitbucketServer {
         targetBranch,
       });
 
-      // Prepare reviewers format if provided
-      // Bitbucket API expects reviewers as array of objects: [{uuid: "{...}"}]
-      // Input is string array of UUIDs: ["{04776764-62c7-453b-b97e-302f60395ceb}", ...]
-      // Convert to API format: [{uuid: "{...}"}, ...]
-      let reviewersArray: Array<{ uuid: string }> | undefined;
+      // Bitbucket Server expects reviewers as array of objects: [{ user: { name: "username" } }]
+      // Input is string array of usernames/slugs
+      let reviewersArray: Array<{ user: { name: string } }> | undefined;
 
       if (reviewers && reviewers.length > 0) {
         reviewersArray = reviewers
-          .filter((uuid) => typeof uuid === "string" && uuid.trim().length > 0)
-          .map((uuid) => ({ uuid: uuid.trim() }));
+          .filter((name) => typeof name === "string" && name.trim().length > 0)
+          .map((name) => ({ user: { name: name.trim() } }));
 
         if (reviewersArray.length === 0) {
           reviewersArray = undefined;
         }
       }
 
-      // Build request payload - only include reviewers if provided
+      // Build request payload for Bitbucket Server format
+      // Server uses fromRef/toRef with branch id in refs/heads/... format
       const requestPayload: Record<string, any> = {
         title,
         description,
-        source: {
-          branch: {
-            name: sourceBranch,
+        fromRef: {
+          id: `refs/heads/${sourceBranch}`,
+          repository: {
+            slug: repo_slug,
+            project: { key: workspace },
           },
         },
-        destination: {
-          branch: {
-            name: targetBranch,
+        toRef: {
+          id: `refs/heads/${targetBranch}`,
+          repository: {
+            slug: repo_slug,
+            project: { key: workspace },
           },
         },
-        close_source_branch: true,
       };
 
       // Only include reviewers field if there are reviewers to add
@@ -2529,7 +2508,7 @@ class BitbucketServer {
 
       // Create the pull request
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests`,
         requestPayload
       );
 
@@ -2569,7 +2548,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}`
       );
 
       return {
@@ -2616,7 +2595,7 @@ class BitbucketServer {
       if (description !== undefined) updateData.description = description;
 
       const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}`,
         updateData
       );
 
@@ -2663,7 +2642,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/activity`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/activities`,
         {
           pagelen,
           page,
@@ -2709,7 +2688,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/approve`
       );
 
       return {
@@ -2749,7 +2728,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.delete(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/approve`
       );
 
       return {
@@ -2793,7 +2772,7 @@ class BitbucketServer {
       const data = message ? { message } : {};
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/decline`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/decline`,
         data
       );
 
@@ -2842,7 +2821,7 @@ class BitbucketServer {
       if (strategy) data.merge_strategy = strategy;
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/merge`,
         data
       );
 
@@ -2889,7 +2868,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/comments`,
         {
           pagelen,
           page,
@@ -2934,25 +2913,15 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      // First get the pull request details to extract commit information
-      const prResponse = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
+      // Bitbucket Server uses a .diff suffix on the pull-requests URL
+      const response = await this.api.get(
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}.diff`,
+        {
+          headers: { Accept: "text/plain" },
+          responseType: "text",
+          maxRedirects: 5,
+        }
       );
-
-      const sourceCommit = prResponse.data.source.commit.hash;
-      const destinationCommit = prResponse.data.destination.commit.hash;
-
-      // Construct the correct diff URL with the proper format
-      // The format is: /repositories/{workspace}/{repo_slug}/diff/{source_repo}:{source_commit}%0D{destination_commit}?from_pullrequest_id={pr_id}&topic=true
-      const diffUrl = `/repositories/${workspace}/${repo_slug}/diff/${workspace}/${repo_slug}:${sourceCommit}%0D${destinationCommit}?from_pullrequest_id=${pull_request_id}&topic=true`;
-
-      const response = await this.api.get(diffUrl, {
-        headers: {
-          Accept: "text/plain",
-        },
-        responseType: "text",
-        maxRedirects: 5, // Enable redirect following
-      });
 
       return {
         content: [
@@ -2997,7 +2966,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/commits`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/commits`,
         {
           pagelen,
           page,
@@ -3046,35 +3015,34 @@ class BitbucketServer {
         inline: inline ? "inline comment" : "general comment",
       });
 
-      // Prepare the comment data
+      // Bitbucket Server uses { text } for comment content
+      // Inline comments use anchor: { line, lineType, path }
       const commentData: any = {
-        content: {
-          raw: content,
-        },
+        text: content,
       };
 
-      // Add pending flag if provided
-      if (pending !== undefined) {
-        commentData.pending = pending;
-      }
-
-      // Add inline information if provided
+      // Add inline anchor if provided
+      // Server lineType: "ADDED" for new lines (to), "REMOVED" for deleted lines (from), "CONTEXT" for unchanged
       if (inline) {
-        commentData.inline = {
+        commentData.anchor = {
           path: inline.path,
+          srcPath: inline.path,
         };
 
-        // Add line number information based on the type
-        if (inline.from !== undefined) {
-          commentData.inline.from = inline.from;
-        }
         if (inline.to !== undefined) {
-          commentData.inline.to = inline.to;
+          commentData.anchor.line = inline.to;
+          commentData.anchor.lineType = "ADDED";
+          commentData.anchor.fileType = "TO";
+        } else if (inline.from !== undefined) {
+          commentData.anchor.line = inline.from;
+          commentData.anchor.lineType = "REMOVED";
+          commentData.anchor.fileType = "FROM";
         }
       }
 
+      // Note: Bitbucket Server does not support pending/draft comments — ignored
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/comments`,
         commentData
       );
 
@@ -3426,101 +3394,21 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string
   ) {
-    try {
-      logger.info("Publishing pending comments for Bitbucket pull request", {
-        workspace,
-        repo_slug,
-        pull_request_id,
-      });
-
-      // First, get all pending comments for the pull request
-      const commentsResult = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
+    // Bitbucket Server does not support pending/draft comments.
+    // Comments are published immediately when created.
+    logger.info("publishPendingComments called (no-op on Bitbucket Server)", {
+      workspace,
+      repo_slug,
+      pull_request_id,
+    });
+    return {
+      content: [
         {
-          pagelen: BITBUCKET_MAX_PAGELEN,
-          all: true,
-          description: "publishPendingComments",
-        }
-      );
-
-      type PendingComment = {
-        id: number;
-        content: { raw?: string; html?: string; markup?: string };
-        inline?: InlineCommentInline;
-        pending?: boolean;
-      };
-
-      const comments = (commentsResult.values || []) as PendingComment[];
-      const pendingComments = comments.filter(
-        (comment: any) => comment.pending === true
-      ) as PendingComment[];
-
-      if (pendingComments.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No pending comments found to publish.",
-            },
-          ],
-        };
-      }
-
-      // Publish each pending comment by updating it with pending=false
-      const publishResults = [];
-      for (const comment of pendingComments) {
-        try {
-          const updateResponse = await this.api.put(
-            `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment.id}`,
-            {
-              content: comment.content,
-              pending: false,
-              ...(comment.inline && { inline: comment.inline }),
-            }
-          );
-          publishResults.push({
-            commentId: comment.id,
-            status: "published",
-            data: updateResponse.data,
-          });
-        } catch (error) {
-          publishResults.push({
-            commentId: comment.id,
-            status: "error",
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                message: `Published ${pendingComments.length} pending comments`,
-                results: publishResults,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      logger.error("Error publishing pending comments", {
-        error,
-        workspace,
-        repo_slug,
-        pull_request_id,
-      });
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to publish pending comments: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
+          type: "text",
+          text: "Pending comments are not supported by Bitbucket Server — comments are published immediately when created.",
+        },
+      ],
+    };
   }
 
   async createDraftPullRequest(
@@ -3579,9 +3467,9 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      // Update the pull request to set draft=false
+      // Update the pull request to set draft=false (Bitbucket Server Data Center 8.x+)
       const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}`,
         {
           draft: false,
         }
@@ -3623,9 +3511,9 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      // Update the pull request to set draft=true
+      // Update the pull request to set draft=true (Bitbucket Server Data Center 8.x+)
       const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}`,
         {
           draft: true,
         }
@@ -3696,7 +3584,7 @@ class BitbucketServer {
         // Get all repositories in the workspace (existing behavior)
         logger.info("Getting all repositories in workspace...");
         const reposResponse = await this.paginator.fetchValues(
-          `/repositories/${wsName}`,
+          `/rest/api/latest/projects/${wsName}/repos`,
           {
             pagelen: BITBUCKET_MAX_PAGELEN,
             all: true,
@@ -3729,15 +3617,13 @@ class BitbucketServer {
           try {
             logger.info(`Checking repository: ${repoSlug}`);
 
-            // Get open PRs for this repository with participants expanded
+            // Get open PRs for this repository
             const prsResponse = await this.api.get(
-              `/repositories/${wsName}/${repoSlug}/pullrequests`,
+              `/rest/api/latest/projects/${wsName}/repos/${repoSlug}/pull-requests`,
               {
                 params: {
                   state: "OPEN",
-                  pagelen: Math.min(limit, 50), // Limit per repo to avoid too much data
-                  fields:
-                    "values.id,values.title,values.description,values.state,values.created_on,values.updated_on,values.author,values.source,values.destination,values.participants.user.nickname,values.participants.role,values.participants.approved,values.links",
+                  limit: Math.min(limit, 50),
                 },
               }
             );
@@ -3756,18 +3642,20 @@ class BitbucketServer {
 
                 logger.debug(
                   `PR ${pr.id} participants:`,
-                  pr.participants.map((p: any) => ({
-                    nickname: p.user?.nickname,
-                    role: p.role,
+                  pr.reviewers?.map((p: any) => ({
+                    slug: p.user?.slug,
+                    name: p.user?.name,
                     approved: p.approved,
                   }))
                 );
 
+                // Bitbucket Server uses reviewers array (not participants)
                 // Check if current user is a reviewer who hasn't approved
-                const userParticipant = pr.participants.find(
+                const reviewers = pr.reviewers || pr.participants || [];
+                const userParticipant = reviewers.find(
                   (participant: any) =>
-                    participant.user?.nickname === currentUserNickname &&
-                    participant.role === "REVIEWER" &&
+                    (participant.user?.slug === currentUserNickname ||
+                      participant.user?.name === currentUserNickname) &&
                     participant.approved === false
                 );
 
@@ -4338,7 +4226,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/comments/${comment_id}`
       );
 
       return {
@@ -4381,12 +4269,15 @@ class BitbucketServer {
         comment_id,
       });
 
-      const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`,
-        {
-          content: { raw: content },
-        }
-      );
+      // Bitbucket Server requires a version field for optimistic locking — fetch current version first
+      const commentUrl = `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/comments/${comment_id}`;
+      const existing = await this.api.get(commentUrl);
+      const version = existing.data?.version ?? 0;
+
+      const response = await this.api.put(commentUrl, {
+        version,
+        text: content,
+      });
 
       return {
         content: [
@@ -4425,7 +4316,7 @@ class BitbucketServer {
       });
 
       await this.api.delete(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/comments/${comment_id}`
       );
 
       return {
@@ -4465,7 +4356,7 @@ class BitbucketServer {
       });
 
       const commentUrl = (id: string) =>
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${id}`;
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/comments/${id}`;
       const resolveUrl = (id: string) => `${commentUrl(id)}/resolve`;
 
       // Bitbucket resolves comment *threads*, and the API expects the thread root comment ID.
@@ -4557,7 +4448,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diffstat`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/changes`,
         {
           pagelen,
           page,
@@ -4599,8 +4490,9 @@ class BitbucketServer {
         pull_request_id,
       });
 
+      // Bitbucket Server uses a .patch suffix on the pull-requests URL
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/patch`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}.patch`,
         {
           headers: { Accept: "text/plain" },
           responseType: "text",
@@ -4644,7 +4536,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/tasks`,
         {
           pagelen,
           page,
@@ -4689,12 +4581,13 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const data: Record<string, any> = { content };
-      if (commentId) data.comment = { id: commentId };
+      // Bitbucket Server uses { text } for task content and anchor for comment linkage
+      const data: Record<string, any> = { text: content };
+      if (commentId) data.anchor = { id: commentId, type: "COMMENT" };
       if (state) data.state = state;
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/tasks`,
         data
       );
 
@@ -4733,7 +4626,9 @@ class BitbucketServer {
         task_id,
       });
 
-      const response = await this.api.get(`/tasks/${task_id}`);
+      const response = await this.api.get(
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/tasks/${task_id}`
+      );
 
       return {
         content: [
@@ -4773,11 +4668,16 @@ class BitbucketServer {
         task_id,
       });
 
-      const data: Record<string, any> = {};
-      if (content !== undefined) data.content = content;
+      // Bitbucket Server requires a version field for optimistic locking — fetch current version first
+      const taskUrl = `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/tasks/${task_id}`;
+      const existing = await this.api.get(taskUrl);
+      const version = existing.data?.version ?? 0;
+
+      const data: Record<string, any> = { version };
+      if (content !== undefined) data.text = content;
       if (state !== undefined) data.state = state;
 
-      const response = await this.api.put(`/tasks/${task_id}`, data);
+      const response = await this.api.put(taskUrl, data);
 
       return {
         content: [
@@ -4815,7 +4715,9 @@ class BitbucketServer {
         task_id,
       });
 
-      await this.api.delete(`/tasks/${task_id}`);
+      await this.api.delete(
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}/tasks/${task_id}`
+      );
 
       return {
         content: [{ type: "text", text: "Task deleted successfully." }],
@@ -4855,8 +4757,20 @@ class BitbucketServer {
         all,
       });
 
+      // Bitbucket Server does not have a /statuses endpoint for pull requests.
+      // Fetch the PR to get the source commit hash, then look up build statuses.
+      const prResponse = await this.api.get(
+        `/rest/api/latest/projects/${workspace}/repos/${repo_slug}/pull-requests/${pull_request_id}`
+      );
+      const commitId = prResponse.data?.fromRef?.latestCommit;
+      if (!commitId) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ values: [], totalFetched: 0 }, null, 2) }],
+        };
+      }
+
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/statuses`,
+        `/rest/build-status/latest/commits/${commitId}`,
         {
           pagelen,
           page,
@@ -4869,8 +4783,6 @@ class BitbucketServer {
         values: result.values,
         page: result.page,
         pagelen: result.pagelen,
-        next: result.next,
-        previous: result.previous,
         fetchedPages: result.fetchedPages,
         totalFetched: result.totalFetched,
       };

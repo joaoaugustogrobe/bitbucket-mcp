@@ -1,7 +1,7 @@
 import type { AxiosInstance } from "axios";
 import type winston from "winston";
 
-export const BITBUCKET_DEFAULT_PAGELEN = 10;
+export const BITBUCKET_DEFAULT_PAGELEN = 25;
 export const BITBUCKET_MAX_PAGELEN = 100;
 export const BITBUCKET_ALL_ITEMS_CAP = 1000;
 
@@ -23,6 +23,8 @@ export interface PaginatedValuesResult<T> {
   fetchedPages: number;
   totalFetched: number;
   previous?: string;
+  isLastPage?: boolean;
+  nextPageStart?: number;
 }
 
 interface PendingRequestConfig {
@@ -50,15 +52,18 @@ export class BitbucketPaginator {
       description,
     } = options;
 
-    const resolvedPagelen = this.normalizePagelen(
-      pagelen ?? defaultPagelen
-    );
+    const resolvedLimit = this.normalizePagelen(pagelen ?? defaultPagelen);
+
+    // Bitbucket Server uses `limit` and `start` (0-based offset) instead of `pagelen`/`page`
+    const startOffset =
+      page !== undefined ? (page - 1) * resolvedLimit : 0;
+
     const requestParams: Record<string, any> = {
       ...params,
-      pagelen: resolvedPagelen,
+      limit: resolvedLimit,
     };
     if (page !== undefined) {
-      requestParams.page = page;
+      requestParams.start = startOffset;
     }
 
     const shouldFetchAll = all === true && page === undefined;
@@ -75,43 +80,49 @@ export class BitbucketPaginator {
       const values = this.extractValues<T>(response.data);
       return {
         values,
-        page: response.data?.page ?? page,
-        pagelen: response.data?.pagelen ?? resolvedPagelen,
-        next: response.data?.next,
-        previous: response.data?.previous,
+        page: page ?? 1,
+        pagelen: response.data?.limit ?? resolvedLimit,
         fetchedPages: 1,
         totalFetched: values.length,
+        isLastPage: response.data?.isLastPage ?? true,
+        nextPageStart: response.data?.nextPageStart,
       };
     }
 
+    // Fetch all pages using Bitbucket Server's isLastPage / nextPageStart
     const aggregated: T[] = [];
     let fetchedPages = 0;
-    let nextRequest: PendingRequestConfig | undefined = requestDescriptor;
-    let firstPageMeta: {
-      page?: number;
-      pagelen: number;
-      previous?: string;
-    } = { pagelen: resolvedPagelen };
+    let currentStart = 0;
+    let firstPageMeta: { pagelen: number } = { pagelen: resolvedLimit };
 
-    while (nextRequest && aggregated.length < maxItems) {
-      const response = await this.performRequest(nextRequest, description, {
+    while (aggregated.length < maxItems) {
+      const currentParams: Record<string, any> = {
+        ...params,
+        limit: resolvedLimit,
+        start: currentStart,
+      };
+
+      const currentRequest: PendingRequestConfig = {
+        url: path,
+        params: currentParams,
+      };
+
+      const response = await this.performRequest(currentRequest, description, {
         page: fetchedPages + 1,
       });
       fetchedPages += 1;
 
       if (fetchedPages === 1) {
         firstPageMeta = {
-          page: response.data?.page,
-          pagelen: response.data?.pagelen ?? resolvedPagelen,
-          previous: response.data?.previous,
+          pagelen: response.data?.limit ?? resolvedLimit,
         };
       }
 
       const values = this.extractValues<T>(response.data);
       aggregated.push(...values);
 
-      if (!response.data?.next) {
-        nextRequest = undefined;
+      // isLastPage === false means there are more pages; anything else (true or missing) means done
+      if (response.data?.isLastPage !== false) {
         break;
       }
 
@@ -120,18 +131,22 @@ export class BitbucketPaginator {
           description: description ?? path,
           maxItems,
         });
-        nextRequest = undefined;
         break;
       }
 
-      this.logger.debug("Following Bitbucket pagination next link", {
+      const nextStart = response.data?.nextPageStart;
+      if (nextStart === undefined || nextStart === null) {
+        break;
+      }
+
+      this.logger.debug("Following Bitbucket Server pagination", {
         description: description ?? path,
-        next: response.data.next,
+        nextPageStart: nextStart,
         fetchedPages,
         totalFetched: aggregated.length,
       });
 
-      nextRequest = { url: response.data.next };
+      currentStart = nextStart;
     }
 
     if (aggregated.length > maxItems) {
@@ -140,11 +155,11 @@ export class BitbucketPaginator {
 
     return {
       values: aggregated,
-      page: firstPageMeta.page,
+      page: 1,
       pagelen: firstPageMeta.pagelen,
-      previous: firstPageMeta.previous,
       fetchedPages,
       totalFetched: aggregated.length,
+      isLastPage: true,
     };
   }
 
